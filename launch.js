@@ -4,7 +4,8 @@
  * Reads `window.LAUNCH_CONFIG` (set inline in each club's index.html). Clicking
  * "Launch this site" starts a launch sequence: the page splits into club
  * details (left) and a 5→1 countdown ring (right), then lifts off into
- * confetti and the post-launch CTA.
+ * confetti. If the page has a `.cta a.visit` link, the browser then goes
+ * straight to that website; otherwise the post-launch CTA is revealed.
  *
  * Sound: if `countdown.mp3` (or `countdownAudio` in the config) exists next to
  * the page, it is played as the whole launch soundtrack. Otherwise a
@@ -410,6 +411,10 @@
   resizeCanvas();
 
   // ---------- Launch sequence UI ----------
+  // When the page has an official-website link, the sequence ends by going
+  // straight to it instead of revealing the CTA.
+  const visitLink = stage.querySelector('.cta a.visit');
+  const visitUrl = visitLink ? visitLink.href : null;
   let panel = null;
   let numEl = null;
   let stepEl = null;
@@ -421,10 +426,11 @@
     panel = document.createElement('aside');
     panel.className = 'launch-panel';
     panel.setAttribute('aria-live', 'assertive');
+    panel.dataset.intro = STYLE.intro;
     panel.innerHTML =
       '<p class="lp-label"><span class="dot"></span> Launch sequence</p>' +
       '<div class="lp-ring">' +
-      '<canvas class="lp-plasma" aria-hidden="true"></canvas>' +
+      '<canvas class="lp-fx" aria-hidden="true"></canvas>' +
       '<span class="lp-num"></span>' +
       '</div>' +
       '<p class="lp-step"></p>' +
@@ -461,9 +467,10 @@
     anchor.after(dl);
   }
 
-  // ---------- Shockwave visuals ----------
-  // A plasma ring around the number plus warp streaks shooting across the
-  // screen from it, drawn on canvases in the club's accent colours.
+  // ---------- Countdown effects ----------
+  // Each club picks a visual style with `countdownStyle` in its config. Every
+  // style draws on a canvas around the number, in the club's accent colours,
+  // and names the CSS entrance animation (`intro`) used for each number.
   function hexToRgb(hex, fallback) {
     const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
     if (!m) return fallback;
@@ -471,10 +478,11 @@
     return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
   }
   const mixWhite = (rgb, t) => rgb.map((c) => Math.round(c + (255 - c) * t));
-  const rgba = (rgb, a) => 'rgba(' + rgb.join(',') + ',' + a + ')';
+  const rgba = (rgb, a) => 'rgba(' + rgb.join(',') + ',' + Math.max(0, Math.min(1, a)) + ')';
   const ACCENT = hexToRgb(cfg.accent, [80, 160, 255]);
   const ACCENT2 = hexToRgb(cfg.accent2, [255, 255, 255]);
   const GLOW = mixWhite(ACCENT, 0.45);
+  const TAU = Math.PI * 2;
 
   function makeSprite(rgb) {
     const size = 64;
@@ -492,195 +500,945 @@
 
   let fx = null;
 
+  function dot(x, y, size, alpha, sprite) {
+    fx.g.globalAlpha = Math.max(0, Math.min(1, alpha));
+    fx.g.drawImage(fx.sprites[sprite || 0], x - size / 2, y - size / 2, size, size);
+  }
+
+  function stroke(rgb, alpha, width) {
+    fx.g.globalAlpha = 1;
+    fx.g.strokeStyle = rgba(rgb, alpha);
+    fx.g.lineWidth = width * fx.dpr;
+    fx.g.stroke();
+  }
+
+  function glowStroke(rgb, alpha, width) {
+    stroke(rgb, alpha * 0.22, width * 4);
+    stroke(mixWhite(rgb, 0.55), alpha, width);
+  }
+
+  function circle(r) {
+    fx.g.beginPath();
+    fx.g.arc(fx.cx, fx.cy, r, 0, TAU);
+  }
+
+  function polar(a, r) {
+    return [fx.cx + Math.cos(a) * r, fx.cy + Math.sin(a) * r];
+  }
+
+  function sparkAt(a, r0, speed) {
+    const [x, y] = polar(a, r0);
+    const v = (0.5 + Math.random()) * speed * fx.dpr;
+    fx.sparks.push({
+      x, y,
+      vx: Math.cos(a) * v,
+      vy: Math.sin(a) * v,
+      size: (6 + Math.random() * 10) * fx.dpr,
+      life: 1,
+      decay: 1 / (35 + Math.random() * 30),
+    });
+  }
+
+  function sparks(count, speed, r0) {
+    for (let i = 0; i < count; i++) sparkAt(Math.random() * TAU, r0 == null ? fx.R : r0, speed);
+  }
+
+  function drawSparks() {
+    for (let i = fx.sparks.length - 1; i >= 0; i--) {
+      const p = fx.sparks[i];
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vx *= 0.96;
+      p.vy *= 0.96;
+      p.life -= p.decay;
+      if (p.life <= 0) {
+        fx.sparks.splice(i, 1);
+        continue;
+      }
+      dot(p.x, p.y, p.size * (0.4 + p.life * 0.6), p.life, 1);
+    }
+    return fx.sparks.length > 0;
+  }
+
+  // Each style: intro (CSS entrance for the number), optional init(s), frame(s)
+  // returning true while it still has something to animate after the countdown,
+  // and optional beat(s, n), liftoff(s), stop(s). `s` is the style's own state.
+  const STYLES = {
+    shockwave: {
+      intro: 'slam',
+      init(s) {
+        s.wisps = [];
+        s.streaks = [];
+        s.waves = [];
+        s.warp = document.createElement('canvas');
+        s.warp.className = 'lp-warp';
+        s.warp.setAttribute('aria-hidden', 'true');
+        body.appendChild(s.warp);
+        s.warp.width = window.innerWidth * fx.dpr;
+        s.warp.height = window.innerHeight * fx.dpr;
+        s.wctx = s.warp.getContext('2d');
+      },
+      beat(s, n) { this.blast(s, 0.7 + (COUNT_FROM - n) * 0.1); },
+      liftoff(s) {
+        this.blast(s, 2);
+        this.streaks(s, 150, 8);
+        fx.on = false;
+      },
+      stop(s) { s.warp.remove(); },
+      blast(s, k) {
+        fx.pulse = k;
+        s.waves.push({ r: fx.R, v: (6 + 6 * k) * fx.dpr, life: 1 });
+        this.streaks(s, Math.round(50 * k), 6);
+        this.wisps(s, Math.round(40 * k), 2.5 * k);
+      },
+      streaks(s, count, speed) {
+        for (let i = 0; i < count; i++) {
+          s.streaks.push({
+            a: Math.random() * TAU,
+            d: (50 + Math.random() * 90) * fx.dpr,
+            v: (speed + Math.random() * speed * 1.5) * fx.dpr,
+            len: (8 + Math.random() * 24) * fx.dpr,
+            w: (1 + Math.random() * 2.2) * fx.dpr,
+            col: Math.random() < 0.18 ? ACCENT2 : mixWhite(ACCENT, 0.25 + Math.random() * 0.45),
+            life: 1,
+          });
+        }
+      },
+      wisps(s, count, speed) {
+        for (let i = 0; i < count; i++) {
+          const a = Math.random() * TAU;
+          const v = (0.3 + Math.random() * speed) * fx.dpr;
+          const [x, y] = polar(a, fx.R);
+          s.wisps.push({
+            x, y,
+            vx: Math.cos(a) * v + Math.cos(a + Math.PI / 2) * 0.4 * fx.dpr,
+            vy: Math.sin(a) * v + Math.sin(a + Math.PI / 2) * 0.4 * fx.dpr,
+            size: (10 + Math.random() * 16) * fx.dpr,
+            life: 1,
+            decay: 1 / (25 + Math.random() * 30),
+          });
+        }
+      },
+      frame(s) {
+        const { cx, cy, dpr } = fx;
+        const g = fx.g;
+        if (fx.on) {
+          const base = fx.R * (1 + fx.pulse * 0.3);
+          const N = 240;
+          for (let i = 0; i < N; i++) {
+            const a = (i / N) * TAU;
+            const wob = Math.sin(a * 5 + fx.t * 2.1) * 0.06 + Math.sin(a * 9 - fx.t * 3.3) * 0.04 + Math.sin(a * 13 + fx.t * 5) * 0.025;
+            const r = base * (1 + wob * (1 + fx.pulse));
+            const size = (20 + 12 * Math.sin(a * 7 + fx.t * 4)) * dpr * (0.8 + fx.intensity * 0.2);
+            dot(cx + Math.cos(a) * r, cy + Math.sin(a) * r, size, Math.min(0.8, 0.22 + fx.intensity * 0.1), i % 3 === 0 ? 1 : 0);
+          }
+          this.wisps(s, Math.round(2 + fx.intensity * 2), 0.8);
+        }
+        for (let i = s.wisps.length - 1; i >= 0; i--) {
+          const p = s.wisps[i];
+          p.x += p.vx;
+          p.y += p.vy;
+          p.vx *= 0.97;
+          p.vy *= 0.97;
+          p.life -= p.decay;
+          if (p.life <= 0) {
+            s.wisps.splice(i, 1);
+            continue;
+          }
+          dot(p.x, p.y, p.size * (0.5 + p.life * 0.5), p.life * 0.5, 1);
+        }
+        for (let i = s.waves.length - 1; i >= 0; i--) {
+          const wv = s.waves[i];
+          wv.r += wv.v;
+          wv.v *= 0.96;
+          wv.life -= 0.035;
+          if (wv.life <= 0) {
+            s.waves.splice(i, 1);
+            continue;
+          }
+          circle(wv.r);
+          stroke(ACCENT, wv.life * 0.35, 10 * wv.life);
+          stroke(mixWhite(ACCENT, 0.7), wv.life * 0.9, 2);
+        }
+
+        const w = s.wctx;
+        const rect = ringEl.getBoundingClientRect();
+        if (rect.width) {
+          s.ox = (rect.left + rect.width / 2) * dpr;
+          s.oy = (rect.top + rect.height / 2) * dpr;
+        }
+        const far = Math.hypot(s.warp.width, s.warp.height);
+        w.globalCompositeOperation = 'source-over';
+        w.clearRect(0, 0, s.warp.width, s.warp.height);
+        w.globalCompositeOperation = 'lighter';
+        w.lineCap = 'round';
+        if (fx.on) this.streaks(s, Math.round(3 + fx.intensity * 4), 2);
+        for (let i = s.streaks.length - 1; i >= 0; i--) {
+          const st = s.streaks[i];
+          st.v *= 1.045;
+          st.d += st.v;
+          st.len = Math.min(st.len + st.v * 0.6, 240 * dpr);
+          st.life -= 0.008;
+          if (st.d - st.len > far || st.life <= 0) {
+            s.streaks.splice(i, 1);
+            continue;
+          }
+          const cos = Math.cos(st.a);
+          const sin = Math.sin(st.a);
+          const from = Math.max(0, st.d - st.len);
+          w.strokeStyle = rgba(st.col, Math.min(1, st.d / (220 * dpr)) * st.life * 0.85);
+          w.lineWidth = st.w;
+          w.beginPath();
+          w.moveTo(s.ox + cos * from, s.oy + sin * from);
+          w.lineTo(s.ox + cos * st.d, s.oy + sin * st.d);
+          w.stroke();
+        }
+        return s.wisps.length > 0 || s.streaks.length > 0 || s.waves.length > 0;
+      },
+    },
+
+    orbit: {
+      intro: 'flip',
+      frame() {
+        if (!fx.on) return false;
+        const { cx, cy, R, t, dpr } = fx;
+        const g = fx.g;
+        const grow = 1 + fx.pulse * 0.18;
+        const speed = 1.4 + fx.intensity * 0.9;
+        dot(cx, cy, R * 1.3 * (1 + fx.pulse * 0.3), 0.22, 0);
+        for (let k = 0; k < 3; k++) {
+          const rot = (k * TAU) / 3 + t * 0.2;
+          const rx = R * 1.18 * grow;
+          const ry = R * 0.42 * grow;
+          g.beginPath();
+          g.ellipse(cx, cy, rx, ry, rot, 0, TAU);
+          stroke(ACCENT, 0.3, 1.2);
+          const cr = Math.cos(rot);
+          const sr = Math.sin(rot);
+          for (let e = 0; e < 2; e++) {
+            const base = t * speed * (1 + k * 0.25) + e * Math.PI;
+            for (let j = 9; j >= 0; j--) {
+              const a = base - j * 0.07;
+              const ex = rx * Math.cos(a);
+              const ey = ry * Math.sin(a);
+              dot(cx + ex * cr - ey * sr, cy + ex * sr + ey * cr, (18 - j * 1.4) * dpr, (1 - j / 10) * 0.85, j === 0 ? 2 : 1);
+            }
+          }
+        }
+        return false;
+      },
+    },
+
+    hud: {
+      intro: 'slide',
+      frame() {
+        if (!fx.on) return false;
+        const { R, t, dpr } = fx;
+        const g = fx.g;
+        for (let i = 0; i < 60; i++) {
+          const a = (i / 60) * TAU - TAU / 4;
+          const lit = i / 60 < fx.progress;
+          const [x1, y1] = polar(a, R * 1.24);
+          const [x2, y2] = polar(a, R * (i % 5 ? 1.3 : 1.36));
+          g.beginPath();
+          g.moveTo(x1, y1);
+          g.lineTo(x2, y2);
+          stroke(lit ? GLOW : ACCENT, lit ? 0.95 : 0.25, lit ? 2 : 1.2);
+        }
+        g.setLineDash([10 * dpr, 8 * dpr]);
+        g.lineDashOffset = -t * 40 * dpr * (1 + fx.intensity);
+        circle(R * 1.06);
+        glowStroke(ACCENT, 0.7, 2);
+        g.setLineDash([]);
+        for (let k = 0; k < 3; k++) {
+          const a0 = -t * (0.8 + fx.intensity * 0.5) + (k * TAU) / 3;
+          g.beginPath();
+          g.arc(fx.cx, fx.cy, R * 0.86, a0, a0 + TAU / 5);
+          glowStroke(GLOW, 0.85, 3);
+        }
+        if (fx.pulse > 0.05) {
+          circle(R * (1.06 + (1 - fx.pulse) * 0.6));
+          stroke(ACCENT2, fx.pulse * 0.8, 2);
+        }
+        return false;
+      },
+    },
+
+    vortex: {
+      intro: 'spin',
+      init(s) { s.p = []; },
+      spawn(s, n, fast) {
+        for (let i = 0; i < n; i++) {
+          s.p.push({
+            a: Math.random() * TAU,
+            r: fx.R * (1.3 + Math.random() * 0.25),
+            w: (0.012 + Math.random() * 0.012) * (fast ? 2 : 1),
+          });
+        }
+      },
+      beat(s) { this.spawn(s, 45, true); },
+      liftoff(s) {
+        s.p.forEach((p) => sparkAt(p.a, p.r, 8));
+        s.p = [];
+        sparks(80, 7);
+        fx.on = false;
+      },
+      frame(s) {
+        const R = fx.R;
+        const g = fx.g;
+        if (fx.on) {
+          this.spawn(s, Math.round(2 + fx.intensity * 3));
+          dot(fx.cx, fx.cy, R * 1.1 * (1 + fx.pulse * 0.4), 0.28, 0);
+        }
+        for (let i = s.p.length - 1; i >= 0; i--) {
+          const p = s.p[i];
+          const [px, py] = polar(p.a, p.r);
+          p.a += p.w * ((R * 1.45) / p.r) * (1 + fx.intensity * 0.4);
+          p.r *= 0.982 - fx.intensity * 0.003;
+          if (p.r < R * 0.42) {
+            s.p.splice(i, 1);
+            continue;
+          }
+          const [x, y] = polar(p.a, p.r);
+          const fade = Math.min(1, (p.r - R * 0.42) / (R * 0.3));
+          g.beginPath();
+          g.moveTo(px, py);
+          g.lineTo(x, y);
+          stroke(GLOW, 0.75 * fade, 2);
+          dot(x, y, 7 * fx.dpr, fade, 1);
+        }
+        return s.p.length > 0;
+      },
+    },
+
+    ripple: {
+      intro: 'rise',
+      init(s) {
+        s.r = [];
+        s.next = 0;
+      },
+      add(s, v, w) { s.r.push({ r: fx.R * 0.38, v: v * fx.dpr, w }); },
+      beat(s) { this.add(s, 3.2, 4); },
+      liftoff(s) {
+        for (let k = 0; k < 5; k++) this.add(s, 2.5 + k * 1.2, 3);
+        sparks(70, 6, fx.R * 0.5);
+        fx.on = false;
+      },
+      frame(s) {
+        const R = fx.R;
+        if (fx.on && fx.t > s.next) {
+          this.add(s, 1.1 + fx.intensity * 0.5, 1.6);
+          s.next = fx.t + 0.42 - fx.intensity * 0.05;
+        }
+        if (fx.on) dot(fx.cx, fx.cy, R * 0.9 * (1 + fx.pulse * 0.5), 0.25, 0);
+        for (let i = s.r.length - 1; i >= 0; i--) {
+          const rr = s.r[i];
+          rr.r += rr.v;
+          const life = 1 - (rr.r - R * 0.38) / (R * 1.35);
+          if (life <= 0) {
+            s.r.splice(i, 1);
+            continue;
+          }
+          circle(rr.r);
+          glowStroke(rr.w > 2 ? GLOW : ACCENT, life * 0.85, rr.w);
+        }
+        return s.r.length > 0;
+      },
+    },
+
+    lightning: {
+      intro: 'flicker',
+      init(s) {
+        s.bolts = [];
+        s.timer = 0;
+      },
+      zig(pts, x1, y1, x2, y2, d, depth) {
+        if (!depth) {
+          pts.push([x2, y2]);
+          return;
+        }
+        const mx = (x1 + x2) / 2 + (Math.random() - 0.5) * d;
+        const my = (y1 + y2) / 2 + (Math.random() - 0.5) * d;
+        this.zig(pts, x1, y1, mx, my, d / 2, depth - 1);
+        this.zig(pts, mx, my, x2, y2, d / 2, depth - 1);
+      },
+      arcBolt(s) {
+        const R = fx.R;
+        const a1 = Math.random() * TAU;
+        const span = 0.5 + Math.random() * 0.9;
+        let [px, py] = polar(a1, R * (0.95 + Math.random() * 0.15));
+        const pts = [[px, py]];
+        for (let a = a1 + 0.25; a <= a1 + span; a += 0.25) {
+          const [x, y] = polar(a, R * (0.92 + Math.random() * 0.22));
+          this.zig(pts, px, py, x, y, R * 0.12, 3);
+          px = x;
+          py = y;
+        }
+        s.bolts.push({ pts, life: 1 });
+      },
+      outBolt(s) {
+        const a = Math.random() * TAU;
+        const [x1, y1] = polar(a, fx.R);
+        const [x2, y2] = polar(a + (Math.random() - 0.5) * 0.4, fx.R * (1.5 + Math.random() * 0.4));
+        const pts = [[x1, y1]];
+        this.zig(pts, x1, y1, x2, y2, fx.R * 0.35, 5);
+        s.bolts.push({ pts, life: 1 });
+      },
+      beat(s) { for (let i = 0; i < 4; i++) this.outBolt(s); },
+      liftoff(s) {
+        for (let i = 0; i < 14; i++) this.outBolt(s);
+        sparks(90, 7);
+        fx.on = false;
+      },
+      frame(s) {
+        const g = fx.g;
+        if (fx.on) {
+          circle(fx.R);
+          stroke(ACCENT, 0.18, 1.5);
+          if (--s.timer <= 0) {
+            this.arcBolt(s);
+            s.timer = Math.max(2, 8 - fx.intensity * 1.5);
+          }
+        }
+        if (fx.pulse > 0.1) dot(fx.cx, fx.cy, fx.R * 2.6, fx.pulse * 0.3, 0);
+        for (let i = s.bolts.length - 1; i >= 0; i--) {
+          const b = s.bolts[i];
+          b.life -= 0.1;
+          if (b.life <= 0) {
+            s.bolts.splice(i, 1);
+            continue;
+          }
+          g.beginPath();
+          g.moveTo(b.pts[0][0], b.pts[0][1]);
+          for (let k = 1; k < b.pts.length; k++) g.lineTo(b.pts[k][0], b.pts[k][1]);
+          glowStroke(GLOW, b.life, 1.8);
+        }
+        return s.bolts.length > 0;
+      },
+    },
+
+    sunburst: {
+      intro: 'zoom',
+      init(s) {
+        s.rot = 0;
+        s.kick = 0;
+      },
+      beat(s) { s.kick = 0.07; },
+      star(x, y, size, alpha) {
+        const g = fx.g;
+        g.beginPath();
+        g.moveTo(x - size, y);
+        g.lineTo(x + size, y);
+        g.moveTo(x, y - size);
+        g.lineTo(x, y + size);
+        stroke(mixWhite(ACCENT2, 0.4), alpha, 1);
+        dot(x, y, size * 1.6, alpha * 0.8, 2);
+      },
+      frame(s) {
+        if (!fx.on) return false;
+        const { cx, cy, R, t, dpr } = fx;
+        const g = fx.g;
+        s.rot += 0.004 + fx.intensity * 0.002 + s.kick;
+        s.kick *= 0.88;
+        const rays = 18;
+        const r0 = R * 0.5;
+        const r1 = R * 1.75;
+        const grad = g.createRadialGradient(cx, cy, r0, cx, cy, r1);
+        grad.addColorStop(0, rgba(GLOW, 0.32 + fx.pulse * 0.25));
+        grad.addColorStop(1, rgba(ACCENT, 0));
+        g.globalAlpha = 1;
+        g.fillStyle = grad;
+        for (let i = 0; i < rays; i++) {
+          const a0 = s.rot + (i * TAU) / rays;
+          const a1 = a0 + TAU / rays / 2;
+          g.beginPath();
+          g.arc(cx, cy, r1, a0, a1);
+          g.arc(cx, cy, r0, a1, a0, true);
+          g.closePath();
+          g.fill();
+        }
+        for (let k = 0; k < 26; k++) {
+          const tw = (Math.sin(t * 3 + k * 1.7) + 1) / 2;
+          const [x, y] = polar(k * 2.399 + s.rot * 0.5, R * (1.0 + (k % 5) * 0.14));
+          this.star(x, y, (3 + 7 * tw) * dpr, 0.3 + 0.7 * tw);
+        }
+        return false;
+      },
+    },
+
+    galaxy: {
+      intro: 'rise',
+      init(s) {
+        s.stars = Array.from({ length: 280 }, (_, i) => {
+          const d = Math.pow(Math.random(), 0.7);
+          return { d, off: (i % 2) * Math.PI + d * 4.2 + (Math.random() - 0.5) * 0.7, size: 3 + Math.random() * 6, tw: Math.random() * TAU };
+        });
+      },
+      angle(st) { return st.off + fx.t * (1 + fx.intensity * 0.5) * (0.5 / (st.d + 0.35)); },
+      frame(s) {
+        if (!fx.on) return false;
+        const { cx, cy, R, t, dpr } = fx;
+        dot(cx, cy, R * 1.5 * (1 + fx.pulse * 0.35), 0.35, 1);
+        for (const st of s.stars) {
+          const a = this.angle(st);
+          const r = R * (0.3 + st.d * 1.25);
+          const tw = 0.55 + 0.45 * Math.sin(t * 4 + st.tw);
+          dot(cx + Math.cos(a) * r, cy + Math.sin(a) * r * 0.55, st.size * dpr * (1 + fx.pulse * 0.5), tw * (0.35 + (1 - st.d) * 0.5), st.d < 0.25 ? 2 : st.d < 0.6 ? 1 : 0);
+        }
+        return false;
+      },
+      liftoff(s) {
+        for (const st of s.stars) if (Math.random() < 0.6) sparkAt(this.angle(st), fx.R * (0.3 + st.d * 1.25), 6);
+        fx.on = false;
+      },
+    },
+
+    bubbles: {
+      intro: 'bounce',
+      init(s) { s.b = []; },
+      spawn(s, n) {
+        for (let i = 0; i < n; i++) {
+          s.b.push({
+            x: fx.cx + (Math.random() - 0.5) * fx.R * 2.4,
+            y: fx.h * 0.82,
+            vy: -(0.7 + Math.random() * 1.3) * fx.dpr,
+            r: (5 + Math.random() * 13) * fx.dpr,
+            wob: Math.random() * TAU,
+          });
+        }
+      },
+      pop(b) {
+        for (let k = 0; k < 6; k++) {
+          const a = Math.random() * TAU;
+          const v = (1 + Math.random() * 2) * fx.dpr;
+          fx.sparks.push({ x: b.x, y: b.y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, size: 5 * fx.dpr, life: 1, decay: 0.06 });
+        }
+      },
+      beat(s) { this.spawn(s, 14); },
+      liftoff(s) {
+        s.b.forEach((b) => this.pop(b));
+        s.b = [];
+        sparks(80, 6);
+        fx.on = false;
+      },
+      frame(s) {
+        const g = fx.g;
+        if (fx.on && Math.random() < 0.3 + fx.intensity * 0.2) this.spawn(s, 1);
+        for (let i = s.b.length - 1; i >= 0; i--) {
+          const b = s.b[i];
+          b.y += b.vy * (1 + fx.intensity * 0.3);
+          b.x += Math.sin(fx.t * 2 + b.wob) * 0.5 * fx.dpr;
+          if (b.y < fx.h * 0.06 || Math.random() < 0.003) {
+            this.pop(b);
+            s.b.splice(i, 1);
+            continue;
+          }
+          dot(b.x, b.y, b.r * 2.2, 0.18, 0);
+          g.beginPath();
+          g.arc(b.x, b.y, b.r, 0, TAU);
+          stroke(GLOW, 0.6, 1.2);
+          dot(b.x - b.r * 0.35, b.y - b.r * 0.35, b.r * 0.6, 0.8, 2);
+        }
+        return s.b.length > 0;
+      },
+    },
+
+    neon: {
+      intro: 'flicker',
+      frame() {
+        if (!fx.on) return false;
+        const { cx, cy, R, t } = fx;
+        const g = fx.g;
+        circle(R * 1.05);
+        stroke(ACCENT, 0.12, 3);
+        const a0 = -TAU / 4;
+        const a1 = a0 + Math.max(0.001, fx.progress) * TAU;
+        g.beginPath();
+        g.arc(cx, cy, R * 1.05, a0, a1);
+        stroke(ACCENT, 0.14, 16);
+        stroke(ACCENT, 0.35, 8);
+        stroke(mixWhite(ACCENT, 0.8), 1, 2.6);
+        const [hx, hy] = polar(a1, R * 1.05);
+        dot(hx, hy, 26 * fx.dpr, 1, 1);
+        circle(R * 0.84);
+        stroke(GLOW, 0.22 + (Math.sin(t * 37) > 0.6 ? 0.18 : 0), 1.5);
+        if (fx.pulse > 0.05) {
+          circle(R * (1.05 + (1 - fx.pulse) * 0.55));
+          stroke(GLOW, fx.pulse * 0.9, 2.5);
+        }
+        return false;
+      },
+    },
+
+    heartbeat: {
+      intro: 'pulse',
+      SHAPE: [0, -0.06, 0.12, -0.12, 1, -0.55, 0.18, -0.08, 0.04, 0],
+      init(s) {
+        s.buf = new Array(140).fill(0);
+        s.spike = -1;
+        s.amp = 1;
+      },
+      beat(s) {
+        s.spike = 0;
+        s.amp = 1;
+      },
+      liftoff(s) {
+        s.spike = 0;
+        s.amp = 1.8;
+        sparks(110, 7);
+        setTimeout(() => { if (fx) fx.on = false; }, 400);
+      },
+      frame(s) {
+        if (!fx.on) return false;
+        const { cy, R, w } = fx;
+        const g = fx.g;
+        let v = (Math.random() - 0.5) * 0.02;
+        if (s.spike >= 0) {
+          const k = Math.floor(s.spike / 2);
+          if (k < this.SHAPE.length) {
+            v = this.SHAPE[k] * s.amp;
+            s.spike++;
+          } else {
+            s.spike = -1;
+          }
+        }
+        s.buf.push(v);
+        s.buf.shift();
+        const x0 = w * 0.08;
+        const x1 = w * 0.92;
+        const base = cy + R * 0.6;
+        const amp = R * 0.55;
+        g.beginPath();
+        s.buf.forEach((val, i) => {
+          const x = x0 + (x1 - x0) * (i / (s.buf.length - 1));
+          if (i) g.lineTo(x, base - val * amp);
+          else g.moveTo(x, base - val * amp);
+        });
+        glowStroke(ACCENT, 0.95, 2);
+        dot(x1, base - s.buf[s.buf.length - 1] * amp, 16 * fx.dpr, 1, 1);
+        circle(R * (1.05 + fx.pulse * 0.1));
+        stroke(ACCENT, 0.25 + fx.pulse * 0.4, 2);
+        return false;
+      },
+    },
+
+    matrix: {
+      intro: 'glitch',
+      GLYPHS: '01アイウエオカキクケコサシスセソ0123456789',
+      glyph() { return this.GLYPHS[Math.floor(Math.random() * this.GLYPHS.length)]; },
+      init(s) {
+        const cols = 16;
+        const span = fx.R * 2.7;
+        s.cols = Array.from({ length: cols }, (_, i) => ({
+          x: fx.cx - span / 2 + (i + 0.5) * (span / cols),
+          y: Math.random() * fx.h,
+          v: (1.5 + Math.random() * 2.5) * fx.dpr,
+          chars: Array.from({ length: 10 }, () => this.glyph()),
+        }));
+        s.glitch = 0;
+      },
+      beat(s) { s.glitch = 8; },
+      frame(s) {
+        if (!fx.on) return false;
+        const { R, dpr } = fx;
+        const g = fx.g;
+        const size = 13 * dpr;
+        const step = size * 1.15;
+        g.save();
+        circle(R * 1.4);
+        g.clip();
+        g.font = '600 ' + size + 'px ui-monospace, Menlo, Consolas, monospace';
+        g.textAlign = 'center';
+        g.globalAlpha = 1;
+        for (const c of s.cols) {
+          c.y += c.v * (1 + fx.intensity * 0.6);
+          if (c.y - step * c.chars.length > fx.h) {
+            c.y = 0;
+            c.v = (1.5 + Math.random() * 2.5) * dpr;
+          }
+          if (Math.random() < 0.1) c.chars[Math.floor(Math.random() * c.chars.length)] = this.glyph();
+          const jx = s.glitch > 0 ? (Math.random() - 0.5) * 14 * dpr : 0;
+          c.chars.forEach((ch, k) => {
+            g.fillStyle = k === 0 ? rgba(mixWhite(ACCENT, 0.8), 1) : rgba(GLOW, 0.8 * (1 - k / c.chars.length));
+            g.fillText(ch, c.x + jx, c.y - k * step);
+          });
+        }
+        g.restore();
+        if (s.glitch > 0) s.glitch--;
+        circle(R * 1.4);
+        stroke(ACCENT, 0.35 + fx.pulse * 0.5, 1.5);
+        return false;
+      },
+    },
+
+    bloom: {
+      intro: 'zoom',
+      init(s) {
+        s.layers = [];
+        s.rot = 0;
+        s.fly = 0;
+      },
+      beat(s, n) { s.layers.push({ k: COUNT_FROM - n, open: 0 }); },
+      liftoff(s) {
+        s.fly = 0.001;
+        sparks(90, 6);
+      },
+      frame(s) {
+        const { cx, cy, R } = fx;
+        const g = fx.g;
+        s.rot += 0.003 + fx.intensity * 0.001;
+        if (s.fly) {
+          s.fly += 0.03;
+          if (s.fly > 1) {
+            fx.on = false;
+            return false;
+          }
+        }
+        dot(cx, cy, R * (1 + fx.pulse * 0.3), 0.25, 0);
+        const alpha = 1 - s.fly;
+        for (const L of s.layers) {
+          L.open = Math.min(1, L.open + 0.05);
+          const ease = 1 - Math.pow(1 - L.open, 3);
+          const len = R * (0.55 + L.k * 0.14) * ease;
+          const r0 = R * 0.42 + s.fly * R * 1.2;
+          const off = s.rot * (L.k % 2 ? -1 : 1) + L.k * (TAU / 16);
+          for (let i = 0; i < 8; i++) {
+            const a = off + (i * TAU) / 8;
+            const [x, y] = polar(a, r0 + len / 2);
+            g.beginPath();
+            g.ellipse(x, y, Math.max(0.1, len / 2), Math.max(0.1, len * 0.17), a, 0, TAU);
+            g.globalAlpha = 1;
+            g.fillStyle = rgba(L.k % 2 ? GLOW : ACCENT, 0.13 * alpha);
+            g.fill();
+            stroke(GLOW, 0.55 * alpha, 1.1);
+          }
+        }
+        return false;
+      },
+    },
+
+    sparkle: {
+      intro: 'rise',
+      init(s) { s.list = []; },
+      add(s, x, y, vx, vy, size) { s.list.push({ x, y, vx, vy, size, life: 0, dur: 50 + Math.random() * 40 }); },
+      beat(s) {
+        for (let i = 0; i < 24; i++) {
+          const a = (i * TAU) / 24;
+          const [x, y] = polar(a, fx.R);
+          this.add(s, x, y, Math.cos(a) * 2 * fx.dpr, Math.sin(a) * 2 * fx.dpr, 14 * fx.dpr);
+        }
+      },
+      liftoff(s) {
+        for (let i = 0; i < 60; i++) {
+          const a = Math.random() * TAU;
+          const v = (2 + Math.random() * 5) * fx.dpr;
+          const [x, y] = polar(a, fx.R * 0.6);
+          this.add(s, x, y, Math.cos(a) * v, Math.sin(a) * v, (8 + Math.random() * 10) * fx.dpr);
+        }
+        fx.on = false;
+      },
+      star(x, y, size, alpha) {
+        const g = fx.g;
+        const q = size * 0.18;
+        g.beginPath();
+        g.moveTo(x, y - size);
+        g.quadraticCurveTo(x + q, y - q, x + size, y);
+        g.quadraticCurveTo(x + q, y + q, x, y + size);
+        g.quadraticCurveTo(x - q, y + q, x - size, y);
+        g.quadraticCurveTo(x - q, y - q, x, y - size);
+        g.globalAlpha = 1;
+        g.fillStyle = rgba(mixWhite(ACCENT2, 0.5), alpha);
+        g.fill();
+        dot(x, y, size * 1.4, alpha * 0.6, 1);
+      },
+      frame(s) {
+        if (fx.on) {
+          for (let i = 0; i < 1 + fx.intensity; i++) {
+            const [x, y] = polar(Math.random() * TAU, fx.R * (0.9 + Math.random() * 0.75));
+            this.add(s, x, y, 0, -0.2 * fx.dpr, (8 + Math.random() * 12) * fx.dpr);
+          }
+          dot(fx.cx, fx.cy, fx.R * 1.1 * (1 + fx.pulse * 0.3), 0.2, 0);
+        }
+        for (let i = s.list.length - 1; i >= 0; i--) {
+          const p = s.list[i];
+          p.life++;
+          p.x += p.vx;
+          p.y += p.vy;
+          p.vx *= 0.97;
+          p.vy *= 0.97;
+          const u = p.life / p.dur;
+          if (u >= 1) {
+            s.list.splice(i, 1);
+            continue;
+          }
+          const tw = Math.sin(u * Math.PI);
+          this.star(p.x, p.y, p.size * tw, tw);
+        }
+        return s.list.length > 0;
+      },
+    },
+
+    spinner: {
+      intro: 'drop',
+      init(s) { s.jump = 0; },
+      beat(s) { s.jump = 1; },
+      liftoff() {
+        for (let i = 0; i < 12; i++) {
+          for (let k = 0; k < 6; k++) sparkAt((i * TAU) / 12 - TAU / 4 + (Math.random() - 0.5) * 0.15, fx.R * 1.05, 6 + k);
+        }
+        fx.on = false;
+      },
+      frame(s) {
+        if (!fx.on) return false;
+        const { R, t, dpr } = fx;
+        s.jump *= 0.88;
+        const speed = 1.2 + fx.intensity * 0.8;
+        const head = (t * speed * 12) % 12;
+        for (let i = 0; i < 12; i++) {
+          const b = Math.max(0, 1 - ((head - i + 12) % 12) / 6);
+          const [x, y] = polar((i / 12) * TAU - TAU / 4, R * (1.05 + s.jump * 0.28));
+          dot(x, y, (9 + 14 * b) * dpr, 0.25 + 0.75 * b, b > 0.8 ? 2 : 1);
+        }
+        const head2 = (t * speed * 8) % 8;
+        for (let i = 0; i < 8; i++) {
+          const b = Math.max(0, 1 - ((head2 - i + 8) % 8) / 4);
+          const [x, y] = polar(-(i / 8) * TAU - TAU / 4, R * 0.8);
+          dot(x, y, (5 + 8 * b) * dpr, 0.2 + 0.6 * b, 0);
+        }
+        return false;
+      },
+    },
+
+    waves: {
+      intro: 'rise',
+      frame() {
+        if (!fx.on) return false;
+        const { cx, cy, R, t } = fx;
+        const g = fx.g;
+        const layers = [[ACCENT, 1, 1.0, 0], [GLOW, 0.7, 1.6, 1.3], [ACCENT2, 0.5, 2.3, 2.6]];
+        const amp0 = R * 0.22 * (1 + fx.intensity * 0.35 + fx.pulse * 1.4);
+        const x0 = cx - R * 1.55;
+        const span = R * 3.1;
+        layers.forEach(([col, a, f, ph]) => {
+          g.beginPath();
+          for (let i = 0; i <= 80; i++) {
+            const u = i / 80;
+            const y = cy + Math.sin(u * TAU * f + t * (3 + f) + ph) * amp0 * a * Math.sin(Math.PI * u);
+            if (i) g.lineTo(x0 + u * span, y);
+            else g.moveTo(x0 + u * span, y);
+          }
+          glowStroke(col, 0.85, 2);
+        });
+        circle(R * 1.15);
+        stroke(ACCENT, 0.2 + fx.pulse * 0.4, 1.5);
+        return false;
+      },
+    },
+
+    equalizer: {
+      intro: 'bounce',
+      init(s) {
+        s.v = new Array(48).fill(0.2);
+        s.target = new Array(48).fill(0.2);
+        s.rot = 0;
+      },
+      beat(s) { s.target = s.target.map(() => 0.7 + Math.random() * 0.3); },
+      liftoff(s) {
+        for (let i = 0; i < 48; i++) sparkAt(s.rot + (i * TAU) / 48, fx.R * 1.5, 7);
+        fx.on = false;
+      },
+      frame(s) {
+        if (!fx.on) return false;
+        const R = fx.R;
+        const g = fx.g;
+        s.rot += 0.004;
+        for (let i = 0; i < 48; i++) {
+          if (Math.random() < 0.08) s.target[i] = 0.1 + Math.random() * (0.35 + fx.intensity * 0.2);
+          s.v[i] += (s.target[i] - s.v[i]) * 0.25;
+          s.target[i] *= 0.97;
+          const a = s.rot + (i / 48) * TAU;
+          const [x1, y1] = polar(a, R);
+          const [x2, y2] = polar(a, R * (1.04 + s.v[i] * 0.55));
+          g.beginPath();
+          g.moveTo(x1, y1);
+          g.lineTo(x2, y2);
+          stroke(ACCENT, 0.25, 9);
+          stroke(mixWhite(ACCENT, 0.3 + s.v[i] * 0.5), 0.95, 4);
+        }
+        circle(R * 0.95);
+        stroke(GLOW, 0.3 + fx.pulse * 0.5, 1.5);
+        return false;
+      },
+    },
+  };
+
+  const STYLE = STYLES[cfg.countdownStyle] || STYLES.shockwave;
+
   function startFx() {
     if (reducedMotion()) return;
     const dpr = devicePixelRatio;
-    const plasma = panel.querySelector('.lp-plasma');
-    plasma.width = plasma.offsetWidth * dpr;
-    plasma.height = plasma.offsetHeight * dpr;
-    const warp = document.createElement('canvas');
-    warp.className = 'lp-warp';
-    warp.setAttribute('aria-hidden', 'true');
-    body.appendChild(warp);
-    warp.width = window.innerWidth * dpr;
-    warp.height = window.innerHeight * dpr;
-    fx = {
-      plasma,
-      pctx: plasma.getContext('2d'),
-      warp,
-      wctx: warp.getContext('2d'),
-      sprites: [makeSprite(ACCENT), makeSprite(GLOW), makeSprite(ACCENT2)],
-      wisps: [],
-      streaks: [],
-      waves: [],
-      pulse: 0,
-      intensity: 0.4,
-      on: true,
-      t: 0,
-    };
-    requestAnimationFrame(drawFx);
-  }
-
-  function ringRadius() {
-    return Math.min(fx.plasma.width, fx.plasma.height) * 0.25;
-  }
-
-  function spawnStreaks(count, speed) {
-    const dpr = devicePixelRatio;
-    for (let i = 0; i < count; i++) {
-      const r = Math.random();
-      fx.streaks.push({
-        a: Math.random() * Math.PI * 2,
-        d: (50 + Math.random() * 90) * dpr,
-        v: (speed + Math.random() * speed * 1.5) * dpr,
-        len: (8 + Math.random() * 24) * dpr,
-        w: (1 + Math.random() * 2.2) * dpr,
-        col: r < 0.18 ? ACCENT2 : mixWhite(ACCENT, 0.25 + Math.random() * 0.45),
-        life: 1,
-      });
-    }
-  }
-
-  function spawnWisps(count, speed) {
-    const dpr = devicePixelRatio;
-    const base = ringRadius();
-    for (let i = 0; i < count; i++) {
-      const a = Math.random() * Math.PI * 2;
-      const v = (0.3 + Math.random() * speed) * dpr;
-      fx.wisps.push({
-        x: fx.plasma.width / 2 + Math.cos(a) * base,
-        y: fx.plasma.height / 2 + Math.sin(a) * base,
-        vx: Math.cos(a) * v + Math.cos(a + Math.PI / 2) * 0.4 * dpr,
-        vy: Math.sin(a) * v + Math.sin(a + Math.PI / 2) * 0.4 * dpr,
-        size: (10 + Math.random() * 16) * dpr,
-        life: 1,
-        decay: 1 / (25 + Math.random() * 30),
-      });
-    }
-  }
-
-  function shockwave(strength) {
-    if (!fx) return;
-    const dpr = devicePixelRatio;
-    fx.pulse = strength;
-    fx.waves.push({ r: ringRadius(), v: (6 + 6 * strength) * dpr, life: 1 });
-    spawnStreaks(Math.round(50 * strength), 6);
-    spawnWisps(Math.round(40 * strength), 2.5 * strength);
-  }
-
-  function drawPlasma() {
-    const g = fx.pctx;
-    const w = fx.plasma.width;
-    const h = fx.plasma.height;
-    const cx = w / 2;
-    const cy = h / 2;
-    const dpr = devicePixelRatio;
-    g.globalCompositeOperation = 'source-over';
-    g.clearRect(0, 0, w, h);
-    g.globalCompositeOperation = 'lighter';
-
-    if (fx.on) {
-      const base = ringRadius() * (1 + fx.pulse * 0.3);
-      const t = fx.t;
-      const N = 240;
-      g.globalAlpha = Math.min(0.8, 0.22 + fx.intensity * 0.1);
-      for (let i = 0; i < N; i++) {
-        const a = (i / N) * Math.PI * 2;
-        const wob = Math.sin(a * 5 + t * 2.1) * 0.06 + Math.sin(a * 9 - t * 3.3) * 0.04 + Math.sin(a * 13 + t * 5) * 0.025;
-        const r = base * (1 + wob * (1 + fx.pulse));
-        const s = (20 + 12 * Math.sin(a * 7 + t * 4)) * dpr * (0.8 + fx.intensity * 0.2);
-        g.drawImage(fx.sprites[i % 3 === 0 ? 1 : 0], cx + Math.cos(a) * r - s / 2, cy + Math.sin(a) * r - s / 2, s, s);
-      }
-      spawnWisps(Math.round(2 + fx.intensity * 2), 0.8);
-    }
-
-    for (let i = fx.wisps.length - 1; i >= 0; i--) {
-      const p = fx.wisps[i];
-      p.x += p.vx;
-      p.y += p.vy;
-      p.vx *= 0.97;
-      p.vy *= 0.97;
-      p.life -= p.decay;
-      if (p.life <= 0) {
-        fx.wisps.splice(i, 1);
-        continue;
-      }
-      const s = p.size * (0.5 + p.life * 0.5);
-      g.globalAlpha = p.life * 0.5;
-      g.drawImage(fx.sprites[1], p.x - s / 2, p.y - s / 2, s, s);
-    }
-
-    g.globalAlpha = 1;
-    for (let i = fx.waves.length - 1; i >= 0; i--) {
-      const wv = fx.waves[i];
-      wv.r += wv.v;
-      wv.v *= 0.96;
-      wv.life -= 0.035;
-      if (wv.life <= 0) {
-        fx.waves.splice(i, 1);
-        continue;
-      }
-      g.strokeStyle = rgba(ACCENT, wv.life * 0.35);
-      g.lineWidth = 10 * wv.life * dpr;
-      g.beginPath();
-      g.arc(cx, cy, wv.r, 0, Math.PI * 2);
-      g.stroke();
-      g.strokeStyle = rgba(mixWhite(ACCENT, 0.7), wv.life * 0.9);
-      g.lineWidth = 2 * dpr;
-      g.stroke();
-    }
-  }
-
-  function drawWarp() {
-    const g = fx.wctx;
-    const c = fx.warp;
-    const dpr = devicePixelRatio;
-    const rect = ringEl.getBoundingClientRect();
-    if (rect.width) {
-      fx.ox = (rect.left + rect.width / 2) * dpr;
-      fx.oy = (rect.top + rect.height / 2) * dpr;
-    }
-    const ox = fx.ox;
-    const oy = fx.oy;
-    const far = Math.hypot(c.width, c.height);
-    g.globalCompositeOperation = 'source-over';
-    g.clearRect(0, 0, c.width, c.height);
-    g.globalCompositeOperation = 'lighter';
+    const c = panel.querySelector('.lp-fx');
+    c.width = c.offsetWidth * dpr;
+    c.height = c.offsetHeight * dpr;
+    const g = c.getContext('2d');
     g.lineCap = 'round';
-    if (fx.on) spawnStreaks(Math.round(3 + fx.intensity * 4), 2);
-
-    for (let i = fx.streaks.length - 1; i >= 0; i--) {
-      const s = fx.streaks[i];
-      s.v *= 1.045;
-      s.d += s.v;
-      s.len = Math.min(s.len + s.v * 0.6, 240 * dpr);
-      s.life -= 0.008;
-      if (s.d - s.len > far || s.life <= 0) {
-        fx.streaks.splice(i, 1);
-        continue;
-      }
-      const cos = Math.cos(s.a);
-      const sin = Math.sin(s.a);
-      g.strokeStyle = rgba(s.col, Math.min(1, s.d / (220 * dpr)) * s.life * 0.85);
-      g.lineWidth = s.w;
-      g.beginPath();
-      g.moveTo(ox + cos * Math.max(0, s.d - s.len), oy + sin * Math.max(0, s.d - s.len));
-      g.lineTo(ox + cos * s.d, oy + sin * s.d);
-      g.stroke();
-    }
+    g.lineJoin = 'round';
+    fx = {
+      c, g, dpr,
+      w: c.width,
+      h: c.height,
+      cx: c.width / 2,
+      cy: c.height / 2,
+      R: Math.min(c.width, c.height) * 0.25,
+      t: 0,
+      start: performance.now(),
+      progress: 0,
+      intensity: 0.4,
+      pulse: 0,
+      on: true,
+      sparks: [],
+      s: {},
+      sprites: [makeSprite(ACCENT), makeSprite(GLOW), makeSprite(ACCENT2)],
+    };
+    if (STYLE.init) STYLE.init(fx.s);
+    requestAnimationFrame(drawFx);
   }
 
   function drawFx() {
     if (!fx) return;
+    const g = fx.g;
     fx.t += 1 / 60;
     fx.pulse *= 0.9;
-    drawPlasma();
-    drawWarp();
-    if (fx.on || fx.streaks.length || fx.wisps.length || fx.waves.length) {
+    fx.progress = Math.min(1, (performance.now() - fx.start) / (COUNT_FROM * 1000));
+    g.globalCompositeOperation = 'source-over';
+    g.globalAlpha = 1;
+    g.clearRect(0, 0, fx.w, fx.h);
+    g.globalCompositeOperation = 'lighter';
+    const busy = STYLE.frame(fx.s);
+    const sparking = drawSparks();
+    if (fx.on || busy || sparking) {
       requestAnimationFrame(drawFx);
     } else {
-      fx.warp.remove();
+      if (STYLE.stop) STYLE.stop(fx.s);
       fx = null;
+    }
+  }
+
+  function fxBeat(n) {
+    if (!fx) return;
+    fx.intensity = 0.4 + (COUNT_FROM - n) * 0.35;
+    fx.pulse = 1;
+    if (STYLE.beat) STYLE.beat(fx.s, n);
+  }
+
+  function fxLiftoff() {
+    if (!fx) return;
+    fx.pulse = 1.5;
+    if (STYLE.liftoff) {
+      STYLE.liftoff(fx.s);
+    } else {
+      sparks(140, 7);
+      fx.on = false;
     }
   }
 
@@ -709,10 +1467,7 @@
     stepEl.textContent = STEP_TEXT[n] || '';
     bars.forEach((bar, i) => bar.classList.toggle('on', i < COUNT_FROM - n + 1));
     statusEl.textContent = 'T-minus ' + n;
-    if (fx) {
-      fx.intensity = 0.4 + (COUNT_FROM - n) * 0.35;
-      shockwave(0.7 + (COUNT_FROM - n) * 0.1);
-    }
+    fxBeat(n);
     if (n < COUNT_FROM && !reducedMotion()) retrigger(panel, 'jolt');
   }
 
@@ -720,13 +1475,9 @@
     numEl.textContent = 'LIFTOFF';
     retrigger(numEl, 'tick');
     panel.classList.add('liftoff');
-    stepEl.textContent = 'We have liftoff';
+    stepEl.textContent = visitUrl ? 'Opening the official website…' : 'We have liftoff';
     statusEl.textContent = 'Liftoff';
-    if (fx) {
-      shockwave(2);
-      spawnStreaks(150, 8);
-      fx.on = false;
-    }
+    fxLiftoff();
     burst(0.5, 0.45, 140);
     setTimeout(() => burst(0.2, 0.6, 70), 250);
     setTimeout(() => burst(0.8, 0.6, 70), 450);
@@ -734,6 +1485,10 @@
   }
 
   function finish() {
+    if (visitUrl) {
+      window.location.assign(visitUrl);
+      return;
+    }
     panel.classList.add('leaving');
     setTimeout(() => {
       flip(stage, () => {
